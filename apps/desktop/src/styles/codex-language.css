@@ -1,0 +1,38 @@
+.cx-codex-language {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 20px;
+  border: 1px solid var(--cx-page-border);
+  border-radius: 8px;
+  background: var(--cx-page-surface);
+  color: var(--cx-page-text);
+}
+.cx-codex-language-heading { display: flex; gap: 12px; align-items: flex-start; }
+.cx-codex-language-heading > svg { flex: 0 0 auto; margin-top: 2px; color: var(--cx-page-blue); }
+.cx-codex-language-heading > div { min-width: 0; }
+.cx-codex-language h3 { margin: 0 0 6px; font-size: 14px; font-weight: 650; }
+.cx-codex-language p { margin: 0; font-size: 12px; line-height: 1.65; overflow-wrap: anywhere; }
+.cx-codex-language-heading p,
+.cx-codex-language-detail { color: var(--cx-page-muted); }
+.cx-codex-language-options,
+.cx-codex-language-actions { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.cx-codex-language-options > label:first-child { display: flex; gap: 12px; align-items: center; font-size: 12px; }
+.cx-codex-language select {
+  max-width: 100%;
+  padding: 7px 12px;
+  border: 1px solid var(--cx-page-border);
+  border-radius: 6px;
+  background: var(--cx-page-control);
+  color: var(--cx-page-text);
+}
+.cx-codex-language select:focus-visible { outline: 2px solid var(--cx-page-blue); outline-offset: 2px; }
+.cx-codex-language-status--active,
+.cx-codex-language-notice { color: var(--cx-page-green); }
+.cx-codex-language-error,
+.cx-codex-language-status--failed { color: var(--ui-danger); }
+.cx-codex-language p > svg { display: inline-block; vertical-align: middle; }
+@media (max-width: 520px) {
+  .cx-codex-language { padding: 16px; }
+  .cx-codex-language-actions { gap: 8px; }
+}

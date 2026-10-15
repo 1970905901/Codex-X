@@ -843,6 +843,89 @@ fn launch_macos_codex_app(app: &MacosCodexApp) -> Result<(), String> {
     })
 }
 
+// Narrow helpers shared with the opt-in locale launcher. They do not quit or
+// launch anything until the explicit locale apply command calls them.
+#[cfg(target_os = "macos")]
+pub(crate) fn locale_platform_command(program: &Path, args: &[&str]) -> Result<Output, String> {
+    let deadline = Instant::now() + CODEX_DESKTOP_COMMAND_TIMEOUT;
+    let output =
+        run_program_with_timeout(program, args, Some(deadline), CODEX_DESKTOP_COMMAND_TIMEOUT)
+            .ok_or("客户端操作超时，未继续应用语言兼容。")?;
+    if !output.status.success() {
+        return Err("客户端操作未完成，请检查官方客户端状态后重试。".into());
+    }
+    Ok(output)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn locale_desktop_app() -> Result<(PathBuf, PathBuf, String, String, String), String> {
+    let deadline = Some(Instant::now() + CODEX_DESKTOP_COMMAND_TIMEOUT);
+    let apps: Vec<_> = macos_codex_apps(deadline)?
+        .into_iter()
+        .filter(|app| {
+            matches!(
+                app.bundle_id.as_str(),
+                "com.openai.codex" | "com.openai.codex.beta"
+            )
+        })
+        .collect();
+    let mut running = Vec::new();
+    for app in &apps {
+        if !macos_main_process_ids(&app.executable_path, deadline)?.is_empty() {
+            running.push(app);
+        }
+    }
+    if running.len() > 1 {
+        return Err("检测到多个官方客户端实例，请先保留一个实例再应用界面语言。".into());
+    }
+    let app = running
+        .first()
+        .copied()
+        .or_else(|| apps.first())
+        .ok_or("未找到官方 Codex 客户端")?;
+    let version = macos_info_plist_version(&app.bundle_path).unwrap_or_else(|| "unknown".into());
+    Ok((
+        app.bundle_path.clone(),
+        app.executable_path.clone(),
+        app.bundle_id.clone(),
+        app.app_name.clone(),
+        version,
+    ))
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn locale_desktop_pids(executable: &Path) -> Result<Vec<u32>, String> {
+    macos_main_process_ids(
+        executable,
+        Some(Instant::now() + CODEX_DESKTOP_COMMAND_TIMEOUT),
+    )
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn locale_quit_desktop(executable: &Path, bundle_id: &str) -> Result<(), String> {
+    if !MACOS_CODEX_BUNDLE_IDS.contains(&bundle_id) {
+        return Err("不支持的客户端身份".into());
+    }
+    if locale_desktop_pids(executable)?.is_empty() {
+        return Ok(());
+    }
+    locale_platform_command(
+        Path::new("/usr/bin/osascript"),
+        &[
+            "-e",
+            &format!("tell application id \"{bundle_id}\" to quit"),
+        ],
+    )?;
+    let deadline = Instant::now() + CODEX_DESKTOP_QUIT_TIMEOUT;
+    while Instant::now() < deadline {
+        if locale_desktop_pids(executable)?.is_empty() {
+            return Ok(());
+        }
+        thread::sleep(CODEX_DESKTOP_POLL_INTERVAL);
+    }
+    Err("客户端未正常退出，已取消语言设置和重新启动；请先结束任务后重试。".into())
+}
+
 #[cfg(target_os = "macos")]
 pub fn restart_codex_desktop() -> Result<(String, bool), String> {
     let detection_deadline = Instant::now()

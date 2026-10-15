@@ -18,6 +18,7 @@ mod app_update;
 mod app_update_channel;
 mod backups;
 mod ccswitch;
+mod codex_language;
 mod config_health;
 mod config_migration;
 mod constants;
@@ -573,6 +574,43 @@ async fn open_codex_config_file(config_dir: Option<String>) -> Result<()> {
     })
     .await
     .map_err(|_| CodexxError::Config("打开配置文件失败，请稍后重试。".to_string()))?
+}
+
+#[tauri::command]
+async fn get_codex_language_status(
+    config_dir: Option<String>,
+) -> Result<codex_language::LanguageStatus> {
+    tauri::async_runtime::spawn_blocking(move || codex_language::get_status(config_dir))
+        .await
+        .map_err(|_| CodexxError::Config("读取 Codex 界面语言状态失败，请重试。".into()))?
+}
+
+#[tauri::command]
+async fn save_codex_language_preferences(
+    config_dir: Option<String>,
+    locale: codex_language::Locale,
+    enabled: bool,
+) -> Result<codex_language::LanguageStatus> {
+    tauri::async_runtime::spawn_blocking(move || {
+        codex_language::save_preferences(config_dir, locale, enabled)
+    })
+    .await
+    .map_err(|_| CodexxError::Config("保存 Codex 界面语言偏好失败，请重试。".into()))?
+}
+
+#[tauri::command]
+async fn apply_codex_language_preferences(
+    config_dir: Option<String>,
+    restore: bool,
+) -> Result<codex_language::LanguageStatus> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let codex_dir = resolve_codex_dir(config_dir.clone())?;
+        sessions::with_session_maintenance(&codex_dir, || {
+            codex_language::apply(config_dir, restore)
+        })
+    })
+    .await
+    .map_err(|_| CodexxError::Config("应用 Codex 界面语言失败，请查看状态后重试。".into()))?
 }
 
 #[tauri::command]
@@ -1879,6 +1917,9 @@ pub fn run() {
             check_codex_config,
             repair_codex_config,
             open_codex_config_file,
+            get_codex_language_status,
+            save_codex_language_preferences,
+            apply_codex_language_preferences,
             get_session_sync_status,
             sync_sessions_provider,
             delete_codex_sessions,

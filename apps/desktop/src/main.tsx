@@ -30,6 +30,8 @@ import { applyProviderRowOrder, orderProviderRows } from "./providerRowOrder";
 import { createPresetProvider, getProviderPreset, getProviderPresetVariant } from "./providerPresets";
 import { validateProviderModelMappings } from "./components/ProviderModelMappings";
 import { createOfficialProfileMonitor } from "./officialProfileMonitor";
+import { createSessionStatusTracker, providerActivationIsBusy, readCurrentSessionStatus, sessionStatusContextKey } from "./sessionOperationState";
+import type { LoadingScope, SessionStatusContext } from "./sessionOperationState";
 import { useConfigHealth } from "./useConfigHealth";
 import { ConfigHealthPanel, ConfigHealthStatus } from "./components/ConfigHealthPanel";
 import { ConfigHealthToast } from "./components/ConfigHealthToast";
@@ -798,6 +800,7 @@ function App() {
   const [healthConfigDir, setHealthConfigDir] = React.useState("");
   const [settingsGeneralRequest, setSettingsGeneralRequest] = React.useState(0);
   const [loading, setLoading] = React.useState(false);
+  const [providerActivationBusy, setProviderActivationBusy] = React.useState(false);
   const [refreshing, setRefreshing] = React.useState(true);
   const [toast, setToast] = React.useState<string>("");
   const [error, setError] = React.useState<string>("");
@@ -843,7 +846,8 @@ function App() {
   const savedProvidersRequestRef = React.useRef(0);
   const providerOrderRequestRef = React.useRef(0);
   const loadingGenerationRef = React.useRef(0);
-  const loadingTokensRef = React.useRef(new Set<number>());
+  const loadingTokensRef = React.useRef(new Map<number, LoadingScope>());
+  const languageLoadingTokenRef = React.useRef<number | null>(null);
   const actionBusyGenerationRef = React.useRef(0);
   const actionBusyTokensRef = React.useRef(new Map<number, string>());
   const skillsMcpNoteBusyRef = React.useRef("");
@@ -854,7 +858,16 @@ function App() {
   const refreshRequestRef = React.useRef(0);
   const aboutLoadKeyRef = React.useRef("");
   const sessionAutoLoadKeyRef = React.useRef("");
-  const sessionLoadRequestRef = React.useRef(0);
+  const sessionStatusTrackerRef = React.useRef(createSessionStatusTracker());
+  const sessionStateRef = React.useRef(state);
+  sessionStateRef.current = state;
+  const providerActivationRevisionRef = React.useRef(0);
+  const providerActivationInFlightRef = React.useRef(0);
+  const sessionMutationInFlightRef = React.useRef(false);
+  const sessionDeleteBusyRef = React.useRef(false);
+  const sessionRefreshPendingRef = React.useRef(false);
+  const sessionSyncToastPendingRef = React.useRef(false);
+  const refreshSyncedSessionStatusRef = React.useRef<() => Promise<SessionSyncStatus | null>>(async () => null);
   const promptRefreshInFlightRef = React.useRef<Promise<BuiltinPromptStatus[]> | null>(null);
   const promptAutoRefreshAttemptedRef = React.useRef(false);
   const promptCatalogReadyRef = React.useRef(false);
@@ -885,6 +898,10 @@ function App() {
     ? activeBuiltinTemplateId
     : "";
 
+  const syncProviderActivationBusy = React.useCallback(() => {
+    setProviderActivationBusy(providerActivationIsBusy(loadingTokensRef.current.values(), actionBusyTokensRef.current.values()));
+  }, []);
+
   const syncActionBusy = React.useCallback(() => {
     let latestToken = -1;
     let latestAction = "";
@@ -895,26 +912,39 @@ function App() {
       }
     }
     setActionBusy(latestAction);
-  }, []);
+    syncProviderActivationBusy();
+  }, [syncProviderActivationBusy]);
 
-  const beginLoading = React.useCallback(() => {
+  const beginLoading = React.useCallback((scope: LoadingScope = "general") => {
     const token = ++loadingGenerationRef.current;
-    loadingTokensRef.current.add(token);
+    loadingTokensRef.current.set(token, scope);
     setLoading(true);
+    syncProviderActivationBusy();
     return token;
-  }, []);
+  }, [syncProviderActivationBusy]);
 
   const endLoading = React.useCallback((token: number) => {
     if (!loadingTokensRef.current.delete(token)) return;
     setLoading(loadingTokensRef.current.size > 0);
-  }, []);
+    syncProviderActivationBusy();
+  }, [syncProviderActivationBusy]);
 
   const beginActionBusy = React.useCallback((action: string) => {
     const token = ++actionBusyGenerationRef.current;
     actionBusyTokensRef.current.set(token, action);
     setActionBusy(action);
+    syncProviderActivationBusy();
     return token;
-  }, []);
+  }, [syncProviderActivationBusy]);
+
+  const handleLanguageBusyChange = React.useCallback((busy: boolean) => {
+    if (busy && languageLoadingTokenRef.current === null) {
+      languageLoadingTokenRef.current = beginLoading();
+    } else if (!busy && languageLoadingTokenRef.current !== null) {
+      endLoading(languageLoadingTokenRef.current);
+      languageLoadingTokenRef.current = null;
+    }
+  }, [beginLoading, endLoading]);
 
   const endActionBusy = React.useCallback((token: number) => {
     if (!actionBusyTokensRef.current.delete(token)) return;
@@ -930,6 +960,36 @@ function App() {
     }
     if (changed) syncActionBusy();
   }, [syncActionBusy]);
+
+  const invalidateSessionStatus = React.useCallback(() => {
+    sessionStatusTrackerRef.current.invalidate();
+    sessionAutoLoadKeyRef.current = "";
+    setSessionStatus(null);
+  }, []);
+
+  const getSessionStatusContext = React.useCallback((): SessionStatusContext | null => {
+    const current = sessionStateRef.current;
+    if (!current || providerActivationInFlightRef.current) return null;
+    return {
+      configDir: current.codexDir,
+      targetProvider: current.modelProvider || "openai",
+      providerRevision: providerActivationRevisionRef.current,
+    };
+  }, []);
+
+  const loadCurrentSessionStatus = React.useCallback(() => readCurrentSessionStatus(
+    sessionStatusTrackerRef.current,
+    getSessionStatusContext,
+    (context) => invoke<SessionSyncStatus>("get_session_sync_status", {
+      configDir: context.configDir,
+      targetProvider: context.targetProvider,
+    }),
+    (status) => {
+      setSessionStatus(status);
+      const context = getSessionStatusContext();
+      if (context) sessionAutoLoadKeyRef.current = sessionStatusContextKey(context);
+    },
+  ), [getSessionStatusContext]);
 
   const invalidatePromptDetail = React.useCallback(() => {
     promptDetailRequestRef.current += 1;
@@ -1405,6 +1465,7 @@ function App() {
     const activeCodexDir = state?.codexDir || configDir;
     setRefreshing(true);
     setError("");
+    sessionStateRef.current = null;
     setState(null);
     setOfficialProfiles([]);
     setSessionStatus(null);
@@ -1414,7 +1475,7 @@ function App() {
     setAboutInfo(null);
     aboutLoadKeyRef.current = "";
     sessionAutoLoadKeyRef.current = "";
-    sessionLoadRequestRef.current += 1;
+    sessionStatusTrackerRef.current.invalidate();
 
     if (includeDiagnostics) {
       setStartupDiagnostics(null);
@@ -1468,6 +1529,7 @@ function App() {
         setConfigDir(next.codexDir);
         setHealthConfigDir(next.codexDir);
         setConfigDirDraft(next.codexDir);
+        sessionStateRef.current = next;
         setState(next);
         setRefreshing(false);
 
@@ -1678,10 +1740,9 @@ function App() {
   const handleActionResult = (result: ActionResult) => {
     const profilesRequestId = ++officialProfilesRequestRef.current;
     const providersRequestId = ++savedProvidersRequestRef.current;
+    sessionStateRef.current = result.state;
     setState(result.state);
-    setSessionStatus(null);
-    sessionAutoLoadKeyRef.current = "";
-    sessionLoadRequestRef.current += 1;
+    invalidateSessionStatus();
     setToast(result.message);
     return Promise.allSettled([
       invoke<SavedPrompt[]>("list_saved_prompts"),
@@ -2009,8 +2070,25 @@ function App() {
     );
   };
 
+  const activateProvider = async (apply: () => Promise<ActionResult>, success: (result: ActionResult) => void) => {
+    if (!getSessionStatusContext() || providerActivationInFlightRef.current || sessionDeleteBusyRef.current
+      || providerActivationIsBusy(loadingTokensRef.current.values(), actionBusyTokensRef.current.values())) return;
+    providerActivationInFlightRef.current += 1;
+    providerActivationRevisionRef.current += 1;
+    if (Array.from(actionBusyTokensRef.current.values()).includes("syncSessions")) sessionRefreshPendingRef.current = true;
+    invalidateSessionStatus();
+    try {
+      await call(apply, success);
+    } finally {
+      providerActivationInFlightRef.current -= 1;
+      if (sessionRefreshPendingRef.current && !sessionMutationInFlightRef.current) {
+        await refreshSyncedSessionStatusRef.current();
+      }
+    }
+  };
+
   const switchProvider = (provider: SavedProvider) =>
-    call(
+    activateProvider(
       () => applyProviderConfig(provider),
       (result) => {
         localStorage.setItem(ACTIVE_PROVIDER_KEY, provider.id);
@@ -2083,7 +2161,7 @@ function App() {
   const saveProviderConfig = saveProviderOnly;
 
   const switchOfficialProvider = (profileId = DEFAULT_OFFICIAL_PROFILE_ID) =>
-    call(
+    activateProvider(
       () => invoke<ActionResult>("switch_official_profile", { configDir: configDir || null, profileId }),
       (result) => {
         localStorage.removeItem(ACTIVE_PROVIDER_KEY);
@@ -2440,7 +2518,7 @@ function App() {
   };
 
   const restartCodexDesktop = async () => {
-    if (restartCodexBusyRef.current) return false;
+    if (restartCodexBusyRef.current || loadingTokensRef.current.size || actionBusyTokensRef.current.size) return false;
     restartCodexBusyRef.current = true;
     setRestartCodexBusy(true);
     const actionToken = beginActionBusy("restartCodexDesktop");
@@ -2845,13 +2923,14 @@ function App() {
   };
 
   const checkSessions = async () => {
-    sessionLoadRequestRef.current += 1;
+    if (!getSessionStatusContext() || loadingTokensRef.current.size || actionBusyTokensRef.current.size || sessionDeleteBusyRef.current) return;
+    sessionStatusTrackerRef.current.invalidate();
     const actionToken = beginActionBusy("checkSessions");
     setSessionStatus(null);
     await call(
-      () => invoke<SessionSyncStatus>("get_session_sync_status", { configDir: configDir || null, targetProvider: null }),
+      loadCurrentSessionStatus,
       (status) => {
-        setSessionStatus(status);
+        if (!status) return;
         if (!status.scanComplete) {
           setToast(status.scanFailures[0] || (lang === "zh" ? "无法确认会话同步状态" : "Unable to verify session sync status"));
           return;
@@ -2867,52 +2946,90 @@ function App() {
   };
 
   React.useEffect(() => {
-    if (tab !== "sessions" || refreshing || !state?.codexDir) return;
-    const loadKey = state.codexDir;
+    if (tab !== "sessions" || refreshing || loading) return;
+    const context = getSessionStatusContext();
+    if (!context) return;
+    const loadKey = sessionStatusContextKey(context);
     if (sessionAutoLoadKeyRef.current === loadKey) return;
-    const requestId = ++sessionLoadRequestRef.current;
     const actionToken = beginActionBusy("checkSessions");
     sessionAutoLoadKeyRef.current = loadKey;
-    void invoke<SessionSyncStatus>("get_session_sync_status", {
-      configDir: loadKey,
-      targetProvider: null,
-    })
-      .then((status) => {
-        if (requestId === sessionLoadRequestRef.current) setSessionStatus(status);
-      })
+    void loadCurrentSessionStatus()
       .catch((sessionError) => {
-        if (requestId !== sessionLoadRequestRef.current) return;
         sessionAutoLoadKeyRef.current = "";
         setError(String(sessionError));
       })
       .finally(() => {
         endActionBusy(actionToken);
       });
-  }, [beginActionBusy, endActionBusy, refreshing, state?.codexDir, tab]);
+  }, [beginActionBusy, endActionBusy, getSessionStatusContext, loadCurrentSessionStatus, loading, refreshing, state?.codexDir, state?.modelProvider, state?.activeSavedProviderId, state?.activeOfficialProfileId, tab]);
 
-  const syncSessions = async () => {
-    sessionLoadRequestRef.current += 1;
+  const refreshSyncedSessionStatus = async () => {
+    if (sessionMutationInFlightRef.current || !getSessionStatusContext()) {
+      sessionRefreshPendingRef.current = true;
+      return null;
+    }
+    sessionRefreshPendingRef.current = false;
+    const loadingToken = beginLoading("sessionSync");
     const actionToken = beginActionBusy("syncSessions");
-    await call(
-      () => invoke<SessionSyncResult>("sync_sessions_provider", { configDir: configDir || null, targetProvider: null }),
-      (result) => {
-        setSessionStatus(result.status);
-        setSelectedSessionIds([]);
-        if (!result.status.scanComplete) {
-          setToast(result.status.scanFailures[0] || (lang === "zh" ? "无法确认会话同步状态" : "Unable to verify session sync status"));
-        } else if (result.status.needsSync) {
-          const remaining = sessionMismatchCount(result.status);
+    try {
+      const status = await loadCurrentSessionStatus();
+      if (status && sessionSyncToastPendingRef.current) {
+        sessionSyncToastPendingRef.current = false;
+        if (!status.scanComplete) {
+          setToast(status.scanFailures[0] || (lang === "zh" ? "无法确认会话同步状态" : "Unable to verify session sync status"));
+        } else if (status.needsSync) {
+          const remaining = sessionMismatchCount(status);
           setToast(lang === "zh"
-            ? `已同步可写的会话索引，仍有 ${remaining} 条需要重试；聊天内容未改动`
-            : `Writable session indexes were synced; ${remaining} still need retrying. Chat content was not changed.`);
+            ? `本轮同步已完成，当前供应商仍有 ${remaining} 条会话需要同步；聊天内容未改动`
+            : `This sync finished; ${remaining} session(s) still need syncing for the current provider. Chat content was not changed.`);
         } else {
           setToast(lang === "zh"
             ? "会话索引已全部同步，聊天内容未改动"
             : "All session indexes are synced. Chat content was not changed.");
         }
-      },
-    );
-    endActionBusy(actionToken);
+      }
+      return status;
+    } catch (sessionError) {
+      sessionSyncToastPendingRef.current = false;
+      setError(String(sessionError));
+      return null;
+    } finally {
+      endLoading(loadingToken);
+      endActionBusy(actionToken);
+    }
+  };
+  refreshSyncedSessionStatusRef.current = refreshSyncedSessionStatus;
+
+  const syncSessions = async () => {
+    const context = getSessionStatusContext();
+    if (!context || loadingTokensRef.current.size || actionBusyTokensRef.current.size || sessionDeleteBusyRef.current) return;
+    // Capture primitives at the click, before the IPC worker can be queued
+    // behind a provider switch. The backend keeps this target for the whole job.
+    const target = { ...context };
+    sessionStatusTrackerRef.current.invalidate();
+    const actionToken = beginActionBusy("syncSessions");
+    const loadingToken = beginLoading("sessionSync");
+    sessionMutationInFlightRef.current = true;
+    sessionSyncToastPendingRef.current = false;
+    setError("");
+    try {
+      await invoke<SessionSyncResult>("sync_sessions_provider", {
+        configDir: target.configDir,
+        targetProvider: target.targetProvider,
+      });
+      setSelectedSessionIds([]);
+      sessionSyncToastPendingRef.current = true;
+    } catch (syncError) {
+      if (target.configDir === sessionStateRef.current?.codexDir) setError(String(syncError));
+    } finally {
+      sessionMutationInFlightRef.current = false;
+      sessionRefreshPendingRef.current = true;
+      // Never apply the old job's status to a newly active provider. Re-read
+      // the current context, or let the in-flight activation do so on completion.
+      await refreshSyncedSessionStatusRef.current();
+      endLoading(loadingToken);
+      endActionBusy(actionToken);
+    }
   };
 
   const toggleSessionSelected = (id: string) => {
@@ -2937,7 +3054,10 @@ function App() {
   };
 
   const deleteSelectedSessions = async () => {
-    if (!selectedSessionIds.length || sessionDeleteBusy || !sessionDeleteSafetyConfirmed) return;
+    if (!selectedSessionIds.length || sessionDeleteBusyRef.current || !sessionDeleteSafetyConfirmed
+      || loadingTokensRef.current.size || actionBusyTokensRef.current.size) return;
+    sessionDeleteBusyRef.current = true;
+    const loadingToken = beginLoading();
     setSessionDeleteBusy(true);
     setToast("");
     setError("");
@@ -2966,7 +3086,9 @@ function App() {
     } catch (e) {
       setError(String(e));
     } finally {
+      sessionDeleteBusyRef.current = false;
       setSessionDeleteBusy(false);
+      endLoading(loadingToken);
     }
   };
 
@@ -3140,6 +3262,7 @@ function App() {
                 loading={loading}
                 testingId={providerTestingId}
                 actionBusy={actionBusy}
+                activationBusy={providerActivationBusy || refreshing || sessionDeleteBusy}
                 orderBusy={providerOrder.directory !== state.codexDir}
                 onReorderProviders={saveProviderOrder}
                 editingProviderId={editingProviderId || (editingDetectedProvider ? providerForm.id : null)}
@@ -3490,6 +3613,8 @@ function App() {
                 configDir={configDir}
                 onChange={async () => { routingRequestRefreshRef.current(); }}
                 generalRequest={settingsGeneralRequest}
+                interactionBusy={loading || refreshing || Boolean(actionBusy) || restartCodexBusy || isAppUpdateBusy(updater.state.phase)}
+                onLanguageBusyChange={handleLanguageBusyChange}
                 configHealthStatus={<ConfigHealthStatus
                   lang={lang}
                   report={configHealth.report}
