@@ -51,6 +51,17 @@ pub(crate) struct DesktopApp {
     pub(crate) version: String,
 }
 
+#[cfg(target_os = "windows")]
+fn windows_app(app: &DesktopApp) -> crate::platform::desktop_windows::WindowsDesktopApp {
+    crate::platform::desktop_windows::WindowsDesktopApp {
+        path: app.path.clone(),
+        executable: app.executable.clone(),
+        bundle_id: app.bundle_id.clone(),
+        name: app.name.clone(),
+        version: app.version.clone(),
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn command(program: &str, args: &[&str]) -> Result<String, String> {
     let output = crate::platform::locale_platform_command(Path::new(program), args)?;
@@ -69,9 +80,38 @@ pub(crate) fn detect() -> Result<DesktopApp, String> {
             version: app.4,
         })
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
     {
-        Err("界面语言兼容目前仅支持可验证签名和进程的 macOS 官方 Codex/ChatGPT 客户端。".into())
+        let app = crate::platform::desktop_windows::detect()?;
+        Ok(DesktopApp {
+            path: app.path,
+            executable: app.executable,
+            bundle_id: app.bundle_id,
+            name: app.name,
+            version: app.version,
+        })
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        Err("当前平台尚未实现可验证官方进程的界面语言启动器。".into())
+    }
+}
+
+pub(crate) fn detect_for_operation() -> Result<DesktopApp, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let app = crate::platform::desktop_windows::detect_fresh()?;
+        Ok(DesktopApp {
+            path: app.path,
+            executable: app.executable,
+            bundle_id: app.bundle_id,
+            name: app.name,
+            version: app.version,
+        })
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        detect()
     }
 }
 
@@ -99,10 +139,26 @@ pub(crate) fn validate(app: &DesktopApp) -> Result<(), String> {
         }
         Ok(())
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        crate::platform::desktop_windows::validate(&windows_app(app))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = app;
         Err("当前平台不支持安全的语言兼容启动".into())
+    }
+}
+
+pub(crate) fn validate_launch(app: &DesktopApp, home: &Path) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        crate::platform::desktop_windows::validate_launch(&windows_app(app), home)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (app, home);
+        Ok(())
     }
 }
 
@@ -111,7 +167,11 @@ pub(crate) fn quit(app: &DesktopApp) -> Result<(), String> {
     {
         crate::platform::locale_quit_desktop(&app.executable, &app.bundle_id)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        crate::platform::desktop_windows::quit(&windows_app(app))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = app;
         Err("当前平台不支持安全的语言兼容启动".into())
@@ -126,7 +186,14 @@ pub(crate) fn ensure_stopped(app: &DesktopApp) -> Result<(), String> {
         }
         Ok(())
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        if !crate::platform::desktop_windows::pids(&windows_app(app))?.is_empty() {
+            return Err("客户端在保存语言前重新启动，已取消写入；请完全退出后重试。".into());
+        }
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = app;
         Err("当前平台不支持安全的语言兼容启动".into())
@@ -141,7 +208,12 @@ pub(crate) fn quit_spawned(app: &DesktopApp, pid: u32) -> Result<(), String> {
         }
         quit(app)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        crate::platform::desktop_windows::verify_process(&windows_app(app), pid)?;
+        quit(app)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = (app, pid);
         Err("当前平台不支持安全的客户端恢复".into())
@@ -149,27 +221,34 @@ pub(crate) fn quit_spawned(app: &DesktopApp, pid: u32) -> Result<(), String> {
 }
 
 pub(crate) fn launch(app: &DesktopApp, home: &Path, port: Option<u16>) -> Result<u32, String> {
-    let mut command = std::process::Command::new(&app.executable);
-    command
-        .env("CODEX_HOME", home)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    if let Some(port) = port {
-        command.args([
-            format!("--remote-debugging-port={port}"),
-            "--remote-debugging-address=127.0.0.1".into(),
-        ]);
+    #[cfg(target_os = "windows")]
+    {
+        return crate::platform::desktop_windows::launch(&windows_app(app), Some(home), port);
     }
-    let reaper = process_reaper()?;
-    let child = command
-        .spawn()
-        .map_err(|_| "无法启动官方客户端，请手动打开客户端后重试。")?;
-    let pid = child.id();
-    reaper
-        .send(child)
-        .map_err(|_| "客户端已启动，但进程监督不可用；请手动恢复并重试。")?;
-    Ok(pid)
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut command = std::process::Command::new(&app.executable);
+        command
+            .env("CODEX_HOME", home)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if let Some(port) = port {
+            command.args([
+                format!("--remote-debugging-port={port}"),
+                "--remote-debugging-address=127.0.0.1".into(),
+            ]);
+        }
+        let reaper = process_reaper()?;
+        let child = command
+            .spawn()
+            .map_err(|_| "无法启动官方客户端，请手动打开客户端后重试。")?;
+        let pid = child.id();
+        reaper
+            .send(child)
+            .map_err(|_| "客户端已启动，但进程监督不可用；请手动恢复并重试。")?;
+        Ok(pid)
+    }
 }
 
 pub(crate) fn verify_listener(app: &DesktopApp, pid: u32, port: u16) -> Result<(), String> {
@@ -185,7 +264,11 @@ pub(crate) fn verify_listener(app: &DesktopApp, pid: u32, port: u16) -> Result<(
         )?;
         verify_listener_output(&output, pid, port)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        crate::platform::desktop_windows::verify_listener(&windows_app(app), pid, port)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = (app, pid, port);
         Err("当前平台无法验证调试端口归属".into())

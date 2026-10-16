@@ -18,6 +18,7 @@ import { PageTransition } from "../components/PageTransition";
 import { Button, ModalShell } from "../components/ui";
 import { UsageStatisticsPage } from "./UsageStatisticsPage";
 import { ProviderFailoverPage } from "./ProviderFailoverPage";
+import type { CodexLanguageStatus } from "../codexLanguageTypes";
 import { CodexLanguageControl } from "../components/CodexLanguageControl";
 import "../styles/utility-pages.css";
 
@@ -117,6 +118,7 @@ export type SettingsPageProps = {
   restartBusy?: boolean;
   interactionBusy?: boolean;
   onLanguageBusyChange?: (busy: boolean) => void;
+  onCodexLanguageSaved?: (status: CodexLanguageStatus) => void;
   generalRequest?: number;
   configHealthStatus?: ReactNode;
   onChange?: () => void | Promise<void>;
@@ -172,6 +174,7 @@ export function SettingsPage({
   restartBusy = false,
   interactionBusy = false,
   onLanguageBusyChange,
+  onCodexLanguageSaved,
   generalRequest = 0,
   configHealthStatus,
   onChange,
@@ -237,7 +240,7 @@ export function SettingsPage({
               )}
             />
 
-            <CodexLanguageControl lang={lang} configDir={configDir} active={active && tab === "general"} disabled={interactionBusy} onBusyChange={onLanguageBusyChange} />
+            <CodexLanguageControl lang={lang} configDir={configDir} active={active && tab === "general"} disabled={interactionBusy} onBusyChange={onLanguageBusyChange} onPreferencesSaved={onCodexLanguageSaved} />
 
             <SettingRow
               icon={Sparkles}

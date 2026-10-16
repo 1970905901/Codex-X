@@ -31,6 +31,7 @@ mod live_config;
 mod paths;
 mod platform;
 mod prompts;
+mod provider_balance;
 mod providers;
 mod remote;
 mod sessions;
@@ -577,6 +578,17 @@ async fn open_codex_config_file(config_dir: Option<String>) -> Result<()> {
 }
 
 #[tauri::command]
+async fn get_provider_balances(
+    config_dir: Option<String>,
+) -> Result<Vec<provider_balance::ProviderBalanceResult>> {
+    tauri::async_runtime::spawn_blocking(move || {
+        provider_balance::get_provider_balances_inner(config_dir)
+    })
+    .await
+    .map_err(|_| CodexxError::Config("读取供应商余额失败，请稍后重试。".into()))?
+}
+
+#[tauri::command]
 async fn get_codex_language_status(
     config_dir: Option<String>,
 ) -> Result<codex_language::LanguageStatus> {
@@ -698,11 +710,18 @@ async fn get_about_info(config_dir: Option<String>) -> Result<AboutInfo> {
 }
 
 #[tauri::command]
-async fn restart_codex_desktop() -> std::result::Result<CodexDesktopRestartResult, String> {
-    let (app_name, was_running) =
-        tauri::async_runtime::spawn_blocking(platform::restart_codex_desktop)
-            .await
-            .map_err(|error| format!("重启 Codex 桌面客户端失败: {error}"))??;
+async fn restart_codex_desktop(
+    config_dir: Option<String>,
+) -> std::result::Result<CodexDesktopRestartResult, String> {
+    let (app_name, was_running) = tauri::async_runtime::spawn_blocking(move || {
+        let codex_dir = resolve_codex_dir(config_dir.clone()).map_err(|e| e.to_string())?;
+        sessions::with_session_maintenance(&codex_dir, || {
+            codex_language::restart_client(config_dir)
+        })
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|error| format!("重启 Codex 桌面客户端失败: {error}"))??;
     Ok(CodexDesktopRestartResult {
         app_name,
         was_running,
@@ -1917,6 +1936,7 @@ pub fn run() {
             check_codex_config,
             repair_codex_config,
             open_codex_config_file,
+            get_provider_balances,
             get_codex_language_status,
             save_codex_language_preferences,
             apply_codex_language_preferences,

@@ -23,6 +23,8 @@ import type { LucideIcon } from "lucide-react";
 import type { Ref } from "react";
 import { PageTransition } from "../components/PageTransition";
 import { OfficialQuotaDialog } from "../components/OfficialQuotaDialog";
+import { ProviderBalanceBadge } from "../components/ProviderBalanceBadge";
+import { supportsProviderBalance, type ProviderBalance } from "../providerBalance";
 import { OfficialAccountBadge } from "../components/OfficialAccountBadge";
 import { ProviderModelMappings, validateProviderModelMappings } from "../components/ProviderModelMappings";
 import { ProviderHeadersControl } from "../components/ProviderHeadersControl";
@@ -154,6 +156,7 @@ export type ProvidersPageProps = {
   copy: ProviderCopy;
   mode: ProviderMode;
   providerRows: readonly ProviderRow[];
+  providerBalances?: { balances: ProviderBalance[]; loading: boolean; failed: boolean };
   loading: boolean;
   testingId: string;
   actionBusy?: string;
@@ -403,6 +406,7 @@ function ListPage({
   configDir,
   copy,
   providerRows,
+  providerBalances,
   loading,
   testingId,
   actionBusy,
@@ -416,7 +420,7 @@ function ListPage({
   onDuplicateProvider,
   onDeleteProvider,
   onReorderProviders,
-}: Pick<ProvidersPageProps, "lang" | "configDir" | "copy" | "providerRows" | "loading" | "testingId" | "actionBusy" | "activationBusy" | "orderBusy" | "onReorderProviders" | "onImportCcSwitch" | "onAddProvider" | "onEnableProvider" | "onTestProvider" | "onEditProvider" | "onDuplicateProvider" | "onDeleteProvider">) {
+}: Pick<ProvidersPageProps, "lang" | "configDir" | "copy" | "providerRows" | "providerBalances" | "loading" | "testingId" | "actionBusy" | "activationBusy" | "orderBusy" | "onReorderProviders" | "onImportCcSwitch" | "onAddProvider" | "onEnableProvider" | "onTestProvider" | "onEditProvider" | "onDuplicateProvider" | "onDeleteProvider">) {
   const [providerToDelete, setProviderToDelete] = useState<ProviderRow | null>(null);
   const [quotaSelection, setQuotaSelection] = useState<{ id: string; configDir: string; email: string | null } | null>(null);
   const [deleting, setDeleting] = useState(false);
@@ -538,13 +542,15 @@ function ListPage({
         {providerRows.length === 0 ? (
           <div className="cx-providers-empty" role="status">{copy.noProviders}</div>
         ) : providerRows.map((row) => {
+          const balance = providerBalances?.balances.find(item => item.source === row.source && item.providerId === row.id);
+          const showBalance = row.source !== "official" && (balance ? balance.supported : supportsProviderBalance(row.baseUrl));
           const testingKey = row.testingKey || `${row.source}-${row.id}`;
           const isTesting = testingId === testingKey;
           const isProtectedOfficial = row.source === "official" && row.isDefaultOfficial === true;
           const key = providerRowKey(row);
           const modelName = row.modelDisplayName || row.model || (lang === "zh" ? "跟随 Codex" : "Follow Codex");
           return (
-            <article className={`cx-providers-row${row.isCurrent ? " cx-providers-row--current" : ""}${row.source === "official" ? " cx-providers-row--official" : ""}${draggedKey === key ? " cx-providers-row--dragging" : ""}${dropTarget?.key === key && draggedKey !== key ? ` cx-providers-row--drop-${dropTarget.position}` : ""}`} key={key} role="listitem" data-provider-key={key}>
+            <article className={`cx-providers-row${row.isCurrent ? " cx-providers-row--current" : ""}${row.source === "official" ? " cx-providers-row--official" : showBalance ? " cx-providers-row--balance" : ""}${draggedKey === key ? " cx-providers-row--dragging" : ""}${dropTarget?.key === key && draggedKey !== key ? ` cx-providers-row--drop-${dropTarget.position}` : ""}`} key={key} role="listitem" data-provider-key={key}>
               <button type="button" className="cx-providers-drag-handle" disabled={sortingDisabled}
                 aria-label={lang === "zh" ? `排序 ${row.providerName}：拖动或按上下箭头移动` : `Reorder ${row.providerName}: drag or use Up and Down arrows`}
                 title={lang === "zh" ? "拖动排序，也可按上下箭头移动" : "Drag to reorder, or use Up and Down arrows"}
@@ -602,6 +608,7 @@ function ListPage({
                 </div>
               </div>
               {row.source === "official" && <OfficialAccountBadge lang={lang} email={row.email} planType={row.planType} hasAuth={Boolean(row.hasAuth)} canQueryQuota={Boolean(row.canQueryQuota)} className="cx-providers-login-badge" />}
+              {showBalance && <ProviderBalanceBadge balance={balance} loading={providerBalances?.loading ?? true} failed={providerBalances?.failed ?? false} lang={lang} />}
               <div className="cx-providers-row-actions">
                 {row.isCurrent && <span className="cx-providers-current-badge"><span aria-hidden="true" />{copy.currentLabel}</span>}
                 <button

@@ -702,11 +702,39 @@ impl Drop for PreparedRuntime {
     }
 }
 
+/// The settings restart button and toast share the language-aware launch path.
+/// Inspection does not change preferences, settings, or the running client.
+pub(crate) fn restart_client(config_dir: Option<String>) -> Result<(String, bool)> {
+    let _operation = operation()
+        .lock()
+        .map_err(|_| CodexxError::Config("已有语言或重启操作正在进行".into()))?;
+    let scope = crate::paths::normalized_path_scope(&config_home(config_dir.clone())?);
+    let has_runtime = {
+        let active = runtime()
+            .lock()
+            .map_err(|_| CodexxError::Config("语言兼容状态忙，请重试".into()))?;
+        scope_available(active.as_ref().map(|item| item.scope.as_str()), &scope)?;
+        active.is_some()
+    };
+    let status = get_status(config_dir.clone())?;
+    if (status.supported || cfg!(target_os = "windows"))
+        && (status.enabled || status.pending_enabled.is_some() || has_runtime)
+    {
+        let applied = apply_locked(config_dir, false)?;
+        return Ok((applied.app_name.unwrap_or_else(|| "Codex".into()), true));
+    }
+    crate::platform::restart_codex_desktop().map_err(CodexxError::Config)
+}
+
 /// Explicit user action only. Never called during status reads or app startup.
 pub(crate) fn apply(config_dir: Option<String>, restore: bool) -> Result<LanguageStatus> {
     let _operation = operation()
         .lock()
         .map_err(|_| CodexxError::Config("已有语言操作正在进行".into()))?;
+    apply_locked(config_dir, restore)
+}
+
+fn apply_locked(config_dir: Option<String>, restore: bool) -> Result<LanguageStatus> {
     let home = config_home(config_dir.clone())?;
     let scope = crate::paths::normalized_path_scope(&home);
     {
@@ -724,8 +752,9 @@ pub(crate) fn apply(config_dir: Option<String>, restore: bool) -> Result<Languag
     let mode = plan_apply(&prefs, &actual, restore)?;
     let compatibility = matches!(&mode, EditMode::Enable)
         || matches!(&mode, EditMode::Restart(locale) if chinese_enabled(locale.as_deref()));
-    let app = desktop::detect().map_err(CodexxError::Config)?;
+    let app = desktop::detect_for_operation().map_err(CodexxError::Config)?;
     desktop::validate(&app).map_err(CodexxError::Config)?;
+    desktop::validate_launch(&app, &home).map_err(CodexxError::Config)?;
     // Allocate every fallible supervision resource before quitting the app.
     desktop::prepare_launch().map_err(CodexxError::Config)?;
     let mut prepared = if compatibility {

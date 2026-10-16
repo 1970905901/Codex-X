@@ -15,6 +15,7 @@ import { OverviewPage } from "./pages/OverviewPage";
 import { AboutPage, SettingsPage, TomlConfigPage } from "./pages/UtilityPages";
 import { PromptsPage } from "./pages/PromptsPage";
 import { SkillsMcpPage, type SkillsMcpNoteKind } from "./pages/SkillsMcpPage";
+import { useProviderBalances } from "./providerBalance";
 import { ProvidersPage, type ProviderCopy, type ProviderRow } from "./pages/ProvidersPage";
 import { AppShell, type AppTab, type AppTheme } from "./components/AppShell";
 import {
@@ -803,6 +804,7 @@ function App() {
   const [providerActivationBusy, setProviderActivationBusy] = React.useState(false);
   const [refreshing, setRefreshing] = React.useState(true);
   const [toast, setToast] = React.useState<string>("");
+  const [languageRestartNotice, setLanguageRestartNotice] = React.useState<{ configDir: string; message: string } | null>(null);
   const [error, setError] = React.useState<string>("");
   const [providerForm, setProviderForm] = React.useState<SavedProvider>(defaultProviderForm);
   const [providerTomlDraft, setProviderTomlDraft] = React.useState("");
@@ -815,7 +817,9 @@ function App() {
   const [providerModelsLoading, setProviderModelsLoading] = React.useState(false);
   const [actionBusy, setActionBusy] = React.useState<string>("");
   const [skillsMcpNoteBusy, setSkillsMcpNoteBusy] = React.useState("");
+  const [restartCodexError, setRestartCodexError] = React.useState("");
   const [restartCodexBusy, setRestartCodexBusy] = React.useState(false);
+  React.useEffect(() => { setLanguageRestartNotice(null); setRestartCodexError(""); }, [configDir]);
   const [promptSyncing, setPromptSyncing] = React.useState(false);
   const [promptDetailLoading, setPromptDetailLoading] = React.useState(false);
   const [promptCatalogReady, setPromptCatalogReady] = React.useState(false);
@@ -1349,6 +1353,13 @@ function App() {
       testingKey: `${row.source}-${row.id}`,
     };
   }), [findLocalProviderForRow, lang, providerCopySourceForRow, providerRows, providerOrder, state?.codexDir]);
+
+  const balanceRevision = React.useMemo(() => JSON.stringify([
+    providerRows.filter(row => row.source !== "official").map(row => [row.source, row.id, row.baseUrl, row.apiKey]),
+    savedProviders.map(provider => [provider.id, provider.tomlConfig]),
+    state?.configText,
+  ]), [providerRows, savedProviders, state?.configText]);
+  const providerBalances = useProviderBalances(state?.codexDir || configDir, balanceRevision, Boolean(state) && !refreshing);
 
   const saveProviderOrder = async (order: string[]): Promise<boolean> => {
     const directory = state?.codexDir;
@@ -2523,14 +2534,17 @@ function App() {
     setRestartCodexBusy(true);
     const actionToken = beginActionBusy("restartCodexDesktop");
     setError("");
+    setRestartCodexError("");
     try {
-      const result = await invoke<CodexDesktopRestartResult>("restart_codex_desktop");
+      const result = await invoke<CodexDesktopRestartResult>("restart_codex_desktop", { configDir });
+      setLanguageRestartNotice(null);
       setToast(result.wasRunning
         ? (lang === "zh" ? `${result.appName} 已重新启动` : `${result.appName} restarted`)
         : (lang === "zh" ? `${result.appName} 已启动` : `${result.appName} started`));
       return true;
     } catch (e) {
       setError(String(e));
+      setRestartCodexError(String(e));
       return false;
     } finally {
       endActionBusy(actionToken);
@@ -3147,8 +3161,18 @@ function App() {
         message={toast}
         error={error}
         loading={Boolean(providerTestingId || providerModelsLoading) && Boolean(toast)}
-        onDismissMessage={() => setToast("")}
-        onDismissError={() => setError("")}
+        persistent={Boolean(error) && error === restartCodexError}
+        action={error && error === restartCodexError ? {
+          label: lang === "zh" ? "重试" : "Retry",
+          onClick: () => { void restartCodexDesktop(); },
+          disabled: restartCodexBusy || loading || Boolean(actionBusy),
+        } : !error && languageRestartNotice?.configDir === configDir && languageRestartNotice.message === toast ? {
+          label: lang === "zh" ? "点我重启" : "Restart now",
+          onClick: () => { void restartCodexDesktop(); },
+          disabled: restartCodexBusy || loading || Boolean(actionBusy),
+        } : undefined}
+        onDismissMessage={() => { setToast(""); setLanguageRestartNotice(null); }}
+        onDismissError={() => { setError(""); setRestartCodexError(""); }}
       />
       {configHealth.noticeVisible && configHealth.notice && <ConfigHealthToast
         lang={lang}
@@ -3258,6 +3282,7 @@ function App() {
                 officialProfileIsDefault={editingOfficialProfileId === DEFAULT_OFFICIAL_PROFILE_ID}
                 canLoadCurrentOfficial={Boolean(state.isOfficialProvider)}
                 providerRows={providerPageRows}
+                providerBalances={providerBalances}
                 configDir={configDir}
                 loading={loading}
                 testingId={providerTestingId}
@@ -3615,6 +3640,17 @@ function App() {
                 generalRequest={settingsGeneralRequest}
                 interactionBusy={loading || refreshing || Boolean(actionBusy) || restartCodexBusy || isAppUpdateBusy(updater.state.phase)}
                 onLanguageBusyChange={handleLanguageBusyChange}
+                onCodexLanguageSaved={(status) => {
+                  setError("");
+                  if (status.pendingEnabled == null) {
+                    setLanguageRestartNotice(null);
+                    setToast(lang === "zh" ? "已取消待重启的语言更改" : "Pending language change cancelled");
+                    return;
+                  }
+                  const message = lang === "zh" ? "语言设置已保存，重启 Codex / ChatGPT 后生效" : "Language setting saved. Restart Codex / ChatGPT to apply.";
+                  setLanguageRestartNotice({ configDir, message });
+                  setToast(message);
+                }}
                 configHealthStatus={<ConfigHealthStatus
                   lang={lang}
                   report={configHealth.report}
