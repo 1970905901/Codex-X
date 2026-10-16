@@ -578,6 +578,19 @@ async fn open_codex_config_file(config_dir: Option<String>) -> Result<()> {
 }
 
 #[tauri::command]
+async fn refresh_provider_balance(
+    config_dir: Option<String>,
+    source: String,
+    provider_id: String,
+) -> Result<provider_balance::ProviderBalanceResult> {
+    tauri::async_runtime::spawn_blocking(move || {
+        provider_balance::refresh_provider_balance_inner(config_dir, source, provider_id)
+    })
+    .await
+    .map_err(|_| CodexxError::Config("刷新供应商余额失败，请稍后重试。".into()))?
+}
+
+#[tauri::command]
 async fn get_provider_balances(
     config_dir: Option<String>,
 ) -> Result<Vec<provider_balance::ProviderBalanceResult>> {
@@ -1936,6 +1949,7 @@ pub fn run() {
             check_codex_config,
             repair_codex_config,
             open_codex_config_file,
+            refresh_provider_balance,
             get_provider_balances,
             get_codex_language_status,
             save_codex_language_preferences,

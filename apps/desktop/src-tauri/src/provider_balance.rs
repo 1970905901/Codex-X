@@ -251,7 +251,7 @@ fn cache() -> &'static Mutex<HashMap<String, Arc<CacheEntry>>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn cached_balance(vendor: Vendor, key: &str) -> BalanceValue {
+fn cached_balance(vendor: Vendor, key: &str, force: bool, requested_at: Instant) -> BalanceValue {
     let mut digest = Sha256::new();
     digest.update(vendor.endpoint().as_bytes());
     digest.update([0]);
@@ -287,7 +287,11 @@ fn cached_balance(vendor: Vendor, key: &str) -> BalanceValue {
         } else {
             SUCCESS_TTL
         };
-        if at.elapsed() < ttl {
+        // A manual refresh bypasses an older TTL entry, but not a request
+        // that finished after this IPC call began. Queued copies of the same
+        // credential therefore share one refresh rather than serially forcing
+        // another HTTP request after acquiring this lock.
+        if *at >= requested_at || (!force && at.elapsed() < ttl) {
             return value.clone();
         }
     }
@@ -555,7 +559,12 @@ impl Decimal {
     }
 }
 
-fn provider_result(source: &str, provider: &SavedProvider) -> ProviderBalanceResult {
+fn provider_result(
+    source: &str,
+    provider: &SavedProvider,
+    force: bool,
+    requested_at: Instant,
+) -> ProviderBalanceResult {
     let mut result = ProviderBalanceResult {
         source: source.into(),
         provider_id: if source == "detected" {
@@ -582,7 +591,7 @@ fn provider_result(source: &str, provider: &SavedProvider) -> ProviderBalanceRes
             return result;
         }
     };
-    let value = cached_balance(vendor, &key);
+    let value = cached_balance(vendor, &key, force, requested_at);
     result.balance_kind = value.kind;
     result.balances = value.balances;
     result.checked_at = Some(value.checked_at);
@@ -618,7 +627,17 @@ fn read_balances_at(
                     (offset..targets.len())
                         .step_by(workers)
                         .take_while(|_| continue_query())
-                        .map(|index| (index, provider_result(targets[index].0, &targets[index].1)))
+                        .map(|index| {
+                            (
+                                index,
+                                provider_result(
+                                    targets[index].0,
+                                    &targets[index].1,
+                                    false,
+                                    Instant::now(),
+                                ),
+                            )
+                        })
                         .collect::<Vec<_>>()
                 })
             })
@@ -656,14 +675,37 @@ struct BalanceMonitor {
 }
 
 fn refresh_delay(result: &Result<Vec<ProviderBalanceResult>>) -> Duration {
-    if result.as_ref().map_or(true, |rows| {
-        rows.iter()
-            .any(|row| row.supported && row.error_code.is_some())
-    }) {
-        FAILURE_TTL
-    } else {
-        SUCCESS_TTL
-    }
+    let Ok(rows) = result else {
+        return FAILURE_TTL;
+    };
+    let now = Utc::now();
+    rows.iter()
+        .filter(|row| row.supported)
+        .map(|row| {
+            let ttl = if row.error_code.is_some() {
+                FAILURE_TTL
+            } else {
+                SUCCESS_TTL
+            };
+            let elapsed = row
+                .checked_at
+                .as_deref()
+                .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+                .map(|checked| {
+                    now.signed_duration_since(checked.with_timezone(&Utc))
+                        .to_std()
+                        .unwrap_or(Duration::ZERO)
+                });
+            elapsed.map_or(ttl, |elapsed| {
+                // checkedAt is second-precision; allow one extra second so
+                // the credential cache's monotonic TTL has certainly expired.
+                // Reading warm/manual-refresh results must not reset a full TTL.
+                ttl.saturating_sub(elapsed)
+                    .saturating_add(Duration::from_secs(1))
+            })
+        })
+        .min()
+        .unwrap_or(SUCCESS_TTL)
 }
 
 impl BalanceMonitor {
@@ -777,4 +819,42 @@ pub(crate) fn get_provider_balances_inner(
     let result = read_balances_at(&home, &|| monitor.is_current(generation));
     monitor.completed(generation, refresh_delay(&result), false);
     result
+}
+
+/// Refresh a single persisted/current card. All connection details are read
+/// again from trusted local provider storage, never accepted from the caller.
+pub(crate) fn refresh_provider_balance_inner(
+    config_dir: Option<String>,
+    source: String,
+    provider_id: String,
+) -> Result<ProviderBalanceResult> {
+    // Include provider lookup in the concurrency window: overlapping calls
+    // may spend different amounts of time reading the store/current config.
+    let requested_at = Instant::now();
+    if !matches!(source.as_str(), "local" | "detected") {
+        return Err(CodexxError::Config(
+            "仅支持刷新已保存或当前检测到的第三方供应商余额。".into(),
+        ));
+    }
+    let home = crate::resolve_codex_dir(config_dir)?;
+    let provider = if source == "local" {
+        providers::list_saved_providers_inner()
+            .map_err(|_| CodexxError::Config("读取已保存供应商失败，请稍后重试。".into()))?
+            .into_iter()
+            .find(|provider| provider.id == provider_id)
+    } else {
+        providers::detected_live_custom_provider(&home)
+            .map_err(|_| {
+                CodexxError::Config("读取当前供应商配置失败，请检查配置格式后重试。".into())
+            })?
+            .filter(|provider| format!("detected-{}", provider.id) == provider_id)
+    }
+    .ok_or_else(|| {
+        CodexxError::Config("该供应商已不存在或当前配置已改变，请刷新供应商列表。".into())
+    })?;
+    if vendor_for_provider(&provider).is_none() {
+        return Err(CodexxError::Config("该供应商不支持余额刷新。".into()));
+    }
+    // Deliberately leave the independent five-minute monitor deadline alone.
+    Ok(provider_result(&source, &provider, true, requested_at))
 }

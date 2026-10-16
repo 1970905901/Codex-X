@@ -24,7 +24,7 @@ import type { Ref } from "react";
 import { PageTransition } from "../components/PageTransition";
 import { OfficialQuotaDialog } from "../components/OfficialQuotaDialog";
 import { ProviderBalanceBadge } from "../components/ProviderBalanceBadge";
-import { supportsProviderBalance, type ProviderBalance } from "../providerBalance";
+import { supportsProviderBalance, type ProviderBalanceState } from "../providerBalance";
 import { OfficialAccountBadge } from "../components/OfficialAccountBadge";
 import { ProviderModelMappings, validateProviderModelMappings } from "../components/ProviderModelMappings";
 import { ProviderHeadersControl } from "../components/ProviderHeadersControl";
@@ -156,7 +156,7 @@ export type ProvidersPageProps = {
   copy: ProviderCopy;
   mode: ProviderMode;
   providerRows: readonly ProviderRow[];
-  providerBalances?: { balances: ProviderBalance[]; loading: boolean; failed: boolean };
+  providerBalances?: ProviderBalanceState;
   loading: boolean;
   testingId: string;
   actionBusy?: string;
@@ -608,7 +608,7 @@ function ListPage({
                 </div>
               </div>
               {row.source === "official" && <OfficialAccountBadge lang={lang} email={row.email} planType={row.planType} hasAuth={Boolean(row.hasAuth)} canQueryQuota={Boolean(row.canQueryQuota)} className="cx-providers-login-badge" />}
-              {showBalance && <ProviderBalanceBadge balance={balance} loading={providerBalances?.loading ?? true} failed={providerBalances?.failed ?? false} lang={lang} />}
+              {showBalance && <ProviderBalanceBadge balance={balance} loading={providerBalances?.loading ?? true} refreshing={providerBalances?.refreshingKeys.includes(`${row.source}:${row.id}`)} failed={providerBalances?.failed ?? false} lang={lang} onRefresh={row.source !== "official" && providerBalances ? () => { void providerBalances.refreshBalance(row.source as "local" | "detected", row.id); } : undefined} />}
               <div className="cx-providers-row-actions">
                 {row.isCurrent && <span className="cx-providers-current-badge"><span aria-hidden="true" />{copy.currentLabel}</span>}
                 <button
