@@ -56,8 +56,56 @@ struct Preferences {
     previous: Option<String>,
     previous_captured: bool,
     applied: Option<String>,
+    // Only a new explicit switch selection creates an intent. Legacy locale /
+    // enabled preferences never become a pending configuration change.
+    pending: Option<PendingLanguage>,
     #[serde(flatten)]
     extra: std::collections::BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingLanguage {
+    enabled: bool,
+    captured_locale: Option<String>,
+    // A successful config write can precede a failed launch. Keep that state
+    // retryable without confusing it with a later external language change.
+    #[serde(default)]
+    written_locale: Option<LocaleSnapshot>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct LocaleSnapshot {
+    locale: Option<String>,
+}
+
+fn chinese_enabled(locale: Option<&str>) -> bool {
+    locale == Some("zh-CN")
+}
+
+fn pending_enabled(prefs: &Preferences, current: &Option<String>) -> Option<bool> {
+    prefs.pending.as_ref().and_then(|pending| {
+        let expected = pending
+            .written_locale
+            .as_ref()
+            .map(|written| &written.locale)
+            .unwrap_or(&pending.captured_locale);
+        (expected == current).then_some(pending.enabled)
+    })
+}
+
+fn stage_switch(prefs: &mut Preferences, enabled: bool, current: Option<String>) {
+    prefs.locale = if enabled {
+        Locale::Chinese
+    } else {
+        Locale::Auto
+    };
+    prefs.enabled = enabled;
+    prefs.pending = (enabled != chinese_enabled(current.as_deref())).then_some(PendingLanguage {
+        enabled,
+        captured_locale: current,
+        written_locale: None,
+    });
 }
 
 #[derive(Clone, Default, Serialize)]
@@ -94,8 +142,9 @@ fn operation() -> &'static Mutex<()> {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct LanguageStatus {
-    locale: Locale,
+    locale: String,
     enabled: bool,
+    pending_enabled: Option<bool>,
     supported: bool,
     app_name: Option<String>,
     app_version: Option<String>,
@@ -103,7 +152,6 @@ pub(crate) struct LanguageStatus {
     message: String,
     ready_pages: usize,
     restore_available: bool,
-    requires_manager: bool,
 }
 
 fn config_home(config_dir: Option<String>) -> Result<PathBuf> {
@@ -206,6 +254,10 @@ fn change_locale(doc: &mut DocumentMut, locale: Option<&str>) -> Result<()> {
 pub(crate) fn get_status(config_dir: Option<String>) -> Result<LanguageStatus> {
     let home = config_home(config_dir)?;
     let (_, prefs) = read_preferences(&home)?;
+    let (_, doc) = document(&home)?;
+    let actual = locale_value(&doc)?;
+    let enabled = chinese_enabled(actual.as_deref());
+    let pending = pending_enabled(&prefs, &actual);
     let scope = crate::paths::normalized_path_scope(&home);
     let current = runtime()
         .lock()
@@ -214,9 +266,10 @@ pub(crate) fn get_status(config_dir: Option<String>) -> Result<LanguageStatus> {
         .filter(|r| r.scope == scope)
         .map(|r| {
             let mut progress = r.progress.lock().unwrap_or_else(|p| p.into_inner()).clone();
-            if r.locale != prefs.locale || !prefs.enabled {
-                progress.phase = "pending".into();
-                progress.message = "偏好已保存，当前窗口仍使用上次设置；请手动应用或恢复。".into();
+            if r.locale.tag() != actual.as_deref() {
+                progress.phase = "inactive".into();
+                progress.message = "Codex 语言配置已改变；重启后使用当前配置。".into();
+                progress.ready_pages = 0;
             }
             progress
         });
@@ -224,16 +277,21 @@ pub(crate) fn get_status(config_dir: Option<String>) -> Result<LanguageStatus> {
     let supported = app.is_ok();
     let app_name = app.as_ref().ok().map(|a| a.name.clone());
     let app_version = app.as_ref().ok().map(|a| a.version.clone());
-    let progress = current.unwrap_or_else(|| Progress {
+    let mut progress = current.unwrap_or_else(|| Progress {
         phase: if supported { "inactive" } else { "unsupported" }.into(),
         message: app
             .err()
-            .unwrap_or_else(|| "偏好不会自动应用；选择后请手动应用并重启客户端。".into()),
+            .unwrap_or_else(|| "语言选择来自 Codex 配置。".into()),
         ready_pages: 0,
     });
+    if pending.is_some() {
+        progress.phase = "pending".into();
+        progress.message = "重启 Codex 后应用所选语言。".into();
+    }
     Ok(LanguageStatus {
-        locale: prefs.locale,
-        enabled: prefs.enabled,
+        locale: actual.unwrap_or_else(|| "auto".into()),
+        enabled,
+        pending_enabled: pending,
         supported,
         app_name,
         app_version,
@@ -241,7 +299,6 @@ pub(crate) fn get_status(config_dir: Option<String>) -> Result<LanguageStatus> {
         message: progress.message,
         ready_pages: progress.ready_pages,
         restore_available: prefs.previous_captured,
-        requires_manager: true,
     })
 }
 
@@ -255,13 +312,16 @@ pub(crate) fn save_preferences(
         .map_err(|_| CodexxError::Config("语言操作忙".into()))?;
     let home = config_home(config_dir.clone())?;
     let (bytes, mut prefs) = read_preferences(&home)?;
-    if enabled && locale == Locale::Auto {
+    if !matches!(
+        (locale, enabled),
+        (Locale::Chinese, true) | (Locale::Auto, false)
+    ) {
         return Err(CodexxError::Config(
-            "自动语言不需要兼容模式；请先选择简体中文或 English。".into(),
+            "请选择开启或关闭 Codex 简体中文。".into(),
         ));
     }
-    prefs.locale = locale;
-    prefs.enabled = enabled;
+    let (_, doc) = document(&home)?;
+    stage_switch(&mut prefs, enabled, locale_value(&doc)?);
     write_preferences(&home, bytes.as_deref(), &prefs)?;
     get_status(config_dir)
 }
@@ -345,7 +405,7 @@ fn supervise(
                 progress(
                     &state,
                     "active",
-                    "界面语言兼容已在官方界面中验证；请保持 Codex-X 运行以支持新窗口。",
+                    "当前 Codex 窗口已验证简体中文兼容。",
                     ready,
                 )
             }
@@ -385,37 +445,106 @@ fn supervise(
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum EditMode {
+    Enable,
+    Disable,
+    Restore,
+    Restart(Option<String>),
+}
+
+fn plan_apply(prefs: &Preferences, current: &Option<String>, restore: bool) -> Result<EditMode> {
+    if restore {
+        return Ok(EditMode::Restore);
+    }
+    match pending_enabled(prefs, current) {
+        Some(true) => Ok(EditMode::Enable),
+        Some(false) => Ok(EditMode::Disable),
+        None => Ok(EditMode::Restart(current.clone())),
+    }
+}
+
 fn edit_stopped_locale(
     home: &Path,
     prefs: &mut Preferences,
     expected_preferences: Option<&[u8]>,
-    restore: bool,
+    mode: &EditMode,
     ensure_stopped: impl FnOnce() -> std::result::Result<(), String>,
 ) -> Result<()> {
     let _guard = acquire_live_config_lock(&home)?;
     ensure_stopped().map_err(CodexxError::Config)?;
     let (before, mut doc) = document(&home)?;
     let current = locale_value(&doc)?;
-    if restore {
-        if prefs.previous_captured && current == prefs.applied {
-            change_locale(&mut doc, prefs.previous.as_deref())?;
+    if matches!(mode, EditMode::Enable | EditMode::Disable)
+        && prefs.pending.is_some()
+        && pending_enabled(prefs, &current).is_none()
+    {
+        return Err(CodexxError::Config(
+            "Codex 的语言配置在重启前已改变，未覆盖该修改；请重新选择开关。".into(),
+        ));
+    }
+    match mode {
+        EditMode::Enable => {
+            let retrying_written_intent = prefs
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.written_locale.is_some());
+            if !retrying_written_intent || !prefs.previous_captured || current != prefs.applied {
+                prefs.previous = current.clone();
+                prefs.previous_captured = true;
+            }
+            change_locale(&mut doc, Some("zh-CN"))?;
+            prefs.locale = Locale::Chinese;
+            prefs.enabled = true;
+            prefs.applied = Some("zh-CN".into());
         }
-        prefs.previous_captured = false;
-        prefs.previous = None;
-        prefs.applied = None;
-        prefs.enabled = false;
-        prefs.locale = Locale::Auto;
-    } else {
-        if !prefs.previous_captured {
-            prefs.previous = current;
-            prefs.previous_captured = true;
+        EditMode::Disable => {
+            if chinese_enabled(current.as_deref()) {
+                let previous = (prefs.previous_captured && current == prefs.applied)
+                    .then_some(prefs.previous.as_deref())
+                    .flatten()
+                    .filter(|previous| !chinese_enabled(Some(previous)));
+                change_locale(&mut doc, previous)?;
+            }
+            prefs.locale = Locale::Auto;
+            prefs.enabled = false;
+            // Keep recovery ownership until the new process starts. A failed
+            // launch must still be able to finish this same disable request.
         }
-        change_locale(&mut doc, prefs.locale.tag())?;
-        prefs.applied = prefs.locale.tag().map(str::to_owned);
+        EditMode::Restore => {
+            if prefs.previous_captured && current == prefs.applied {
+                change_locale(&mut doc, prefs.previous.as_deref())?;
+            }
+            prefs.previous_captured = false;
+            prefs.previous = None;
+            prefs.applied = None;
+            prefs.enabled = false;
+            prefs.locale = Locale::Auto;
+            prefs.pending = None;
+        }
+        EditMode::Restart(expected) => {
+            if &current != expected {
+                return Err(CodexxError::Config(
+                    "Codex 的语言配置在重启前已改变，未覆盖该修改。".into(),
+                ));
+            }
+            if prefs.pending.is_some() {
+                let mut refreshed = prefs.clone();
+                refreshed.pending = None;
+                write_preferences(home, expected_preferences, &refreshed)?;
+                *prefs = refreshed;
+            }
+            return Ok(());
+        }
+    }
+    if let Some(pending) = &mut prefs.pending {
+        pending.written_locale = Some(LocaleSnapshot {
+            locale: locale_value(&doc)?,
+        });
     }
     let replacement = doc.to_string();
     // Capture the recovery intent before changing the official setting.
-    if restore {
+    if matches!(mode, EditMode::Restore) {
         atomic_write_if_unchanged(
             &crate::config_path(&home),
             before.as_deref(),
@@ -431,6 +560,24 @@ fn edit_stopped_locale(
             )
         })
     }
+}
+
+fn finish_language_apply(home: &Path, prefs: &mut Preferences, mode: &EditMode) -> Result<()> {
+    if prefs.pending.is_none() {
+        return Ok(());
+    }
+    let expected = serde_json::to_vec_pretty(prefs)
+        .map_err(|_| CodexxError::Config("无法编码语言恢复记录".into()))?;
+    let mut finished = prefs.clone();
+    finished.pending = None;
+    if matches!(mode, EditMode::Disable | EditMode::Restore) {
+        finished.previous_captured = false;
+        finished.previous = None;
+        finished.applied = None;
+    }
+    write_preferences(home, Some(&expected), &finished)?;
+    *prefs = finished;
+    Ok(())
 }
 
 fn commit_language_intent(
@@ -572,17 +719,21 @@ pub(crate) fn apply(config_dir: Option<String>, restore: bool) -> Result<Languag
         )?;
     }
     let (bytes, mut prefs) = read_preferences(&home)?;
+    let (_, initial) = document(&home)?;
+    let actual = locale_value(&initial)?;
+    let mode = plan_apply(&prefs, &actual, restore)?;
+    let compatibility = matches!(&mode, EditMode::Enable)
+        || matches!(&mode, EditMode::Restart(locale) if chinese_enabled(locale.as_deref()));
     let app = desktop::detect().map_err(CodexxError::Config)?;
     desktop::validate(&app).map_err(CodexxError::Config)?;
-    if !restore && prefs.locale == Locale::Auto && prefs.enabled {
-        return Err(CodexxError::Config("请先选择明确的界面语言".into()));
-    }
-    let (_, initial) = document(&home)?;
-    locale_value(&initial)?;
     // Allocate every fallible supervision resource before quitting the app.
     desktop::prepare_launch().map_err(CodexxError::Config)?;
-    let mut prepared = if !restore && prefs.enabled {
-        Some(PreparedRuntime::prepare(&home, app.clone(), prefs.locale)?)
+    let mut prepared = if compatibility {
+        Some(PreparedRuntime::prepare(
+            &home,
+            app.clone(),
+            Locale::Chinese,
+        )?)
     } else {
         None
     };
@@ -597,7 +748,7 @@ pub(crate) fn apply(config_dir: Option<String>, restore: bool) -> Result<Languag
     let started_pid = std::cell::Cell::new(None);
     complete_after_quit(
         || {
-            edit_stopped_locale(&home, &mut prefs, bytes.as_deref(), restore, || {
+            edit_stopped_locale(&home, &mut prefs, bytes.as_deref(), &mode, || {
                 desktop::ensure_stopped(&app)
             })?;
             if let Some(mut pending) = prepared.take() {
@@ -606,11 +757,17 @@ pub(crate) fn apply(config_dir: Option<String>, restore: bool) -> Result<Languag
                     .map_err(CodexxError::Config)?;
                 started_pid.set(Some(pid));
                 let active = pending.activate(pid)?;
+                if let Err(error) = finish_language_apply(&home, &mut prefs, &mode) {
+                    active.stop();
+                    return Err(error);
+                }
                 *runtime()
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(active);
             } else {
-                desktop::launch(&app, &home, None).map_err(CodexxError::Config)?;
+                let pid = desktop::launch(&app, &home, None).map_err(CodexxError::Config)?;
+                started_pid.set(Some(pid));
+                finish_language_apply(&home, &mut prefs, &mode)?;
             }
             Ok(())
         },
@@ -627,6 +784,309 @@ pub(crate) fn apply(config_dir: Option<String>, restore: bool) -> Result<Languag
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn config_dir(home: &Path) -> Option<String> {
+        Some(home.to_string_lossy().into_owned())
+    }
+
+    fn fixture_locale(home: &Path, locale: &str) {
+        std::fs::write(
+            crate::config_path(home),
+            format!("# private language fixture\n[desktop]\nlocaleOverride='{locale}'\nunknown='keep'\n"),
+        )
+        .unwrap();
+    }
+
+    fn edit_pending(home: &Path, mode: &EditMode) -> Preferences {
+        let (bytes, mut prefs) = read_preferences(home).unwrap();
+        edit_stopped_locale(home, &mut prefs, bytes.as_deref(), mode, || Ok(())).unwrap();
+        prefs
+    }
+
+    #[test]
+    fn status_reads_real_locale_and_old_preferences_do_not_create_pending_changes() {
+        let home = tempfile::tempdir().unwrap();
+        fixture_locale(home.path(), "zh-CN");
+        let old = br#"{"locale":"en-US","enabled":false,"unknownPreference":"keep"}"#;
+        let path = prefs_path(home.path()).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, old).unwrap();
+        let before = std::fs::read(crate::config_path(home.path())).unwrap();
+        let status = get_status(config_dir(home.path())).unwrap();
+        assert_eq!(status.locale, "zh-CN");
+        assert!(status.enabled);
+        assert_eq!(status.pending_enabled, None);
+        assert!(serde_json::to_value(&status)
+            .unwrap()
+            .get("requiresManager")
+            .is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), old);
+        assert_eq!(
+            std::fs::read(crate::config_path(home.path())).unwrap(),
+            before
+        );
+
+        fixture_locale(home.path(), "ja-JP");
+        let status = get_status(config_dir(home.path())).unwrap();
+        assert_eq!(status.locale, "ja-JP");
+        assert!(!status.enabled);
+        assert_eq!(status.pending_enabled, None);
+        assert_eq!(std::fs::read(&path).unwrap(), old);
+    }
+
+    #[test]
+    fn saving_switch_only_stages_an_explicit_target_and_can_cancel_it() {
+        let home = tempfile::tempdir().unwrap();
+        fixture_locale(home.path(), "fr-FR");
+        let before = std::fs::read(crate::config_path(home.path())).unwrap();
+        let status = save_preferences(config_dir(home.path()), Locale::Chinese, true).unwrap();
+        assert_eq!(status.locale, "fr-FR");
+        assert!(!status.enabled);
+        assert_eq!(status.pending_enabled, Some(true));
+        assert_eq!(
+            std::fs::read(crate::config_path(home.path())).unwrap(),
+            before
+        );
+        let (_, prefs) = read_preferences(home.path()).unwrap();
+        assert_eq!(
+            prefs.pending.as_ref().unwrap().captured_locale.as_deref(),
+            Some("fr-FR")
+        );
+
+        let status = save_preferences(config_dir(home.path()), Locale::Auto, false).unwrap();
+        assert_eq!(status.pending_enabled, None);
+        assert!(!read_preferences(home.path()).unwrap().1.pending.is_some());
+        assert_eq!(
+            std::fs::read(crate::config_path(home.path())).unwrap(),
+            before
+        );
+        assert!(save_preferences(config_dir(home.path()), Locale::English, true).is_err());
+    }
+
+    #[test]
+    fn external_language_changes_invalidate_pending_without_status_writes() {
+        let home = tempfile::tempdir().unwrap();
+        fixture_locale(home.path(), "fr-FR");
+        save_preferences(config_dir(home.path()), Locale::Chinese, true).unwrap();
+        let bytes = std::fs::read(prefs_path(home.path()).unwrap()).unwrap();
+        fixture_locale(home.path(), "ja-JP");
+        let status = get_status(config_dir(home.path())).unwrap();
+        assert_eq!(status.locale, "ja-JP");
+        assert_eq!(status.pending_enabled, None);
+        assert_eq!(
+            std::fs::read(prefs_path(home.path()).unwrap()).unwrap(),
+            bytes
+        );
+        let (_, mut prefs) = read_preferences(home.path()).unwrap();
+        let (_, doc) = document(home.path()).unwrap();
+        let mode = plan_apply(&prefs, &locale_value(&doc).unwrap(), false).unwrap();
+        assert_eq!(mode, EditMode::Restart(Some("ja-JP".into())));
+        let before = std::fs::read(crate::config_path(home.path())).unwrap();
+        assert!(edit_stopped_locale(
+            home.path(),
+            &mut prefs,
+            Some(&bytes),
+            &EditMode::Enable,
+            || Ok(())
+        )
+        .is_err());
+        assert_eq!(
+            std::fs::read(crate::config_path(home.path())).unwrap(),
+            before
+        );
+        edit_stopped_locale(home.path(), &mut prefs, Some(&bytes), &mode, || Ok(())).unwrap();
+        assert!(read_preferences(home.path()).unwrap().1.pending.is_none());
+        assert_eq!(
+            std::fs::read(crate::config_path(home.path())).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn external_change_back_to_original_locale_wins_after_a_completed_config_write() {
+        let home = tempfile::tempdir().unwrap();
+        fixture_locale(home.path(), "fr-FR");
+        save_preferences(config_dir(home.path()), Locale::Chinese, true).unwrap();
+        edit_pending(home.path(), &EditMode::Enable);
+        fixture_locale(home.path(), "fr-FR");
+        let (_, prefs) = read_preferences(home.path()).unwrap();
+        let current = Some("fr-FR".into());
+        assert_eq!(pending_enabled(&prefs, &current), None);
+        assert_eq!(
+            plan_apply(&prefs, &current, false).unwrap(),
+            EditMode::Restart(current)
+        );
+        assert_eq!(
+            get_status(config_dir(home.path())).unwrap().pending_enabled,
+            None
+        );
+    }
+
+    #[test]
+    fn switch_enable_and_disable_restore_previous_locale_and_finish_pending() {
+        let home = tempfile::tempdir().unwrap();
+        fixture_locale(home.path(), "fr-FR");
+        save_preferences(config_dir(home.path()), Locale::Chinese, true).unwrap();
+        let mut prefs = edit_pending(home.path(), &EditMode::Enable);
+        assert_eq!(prefs.previous.as_deref(), Some("fr-FR"));
+        let status = get_status(config_dir(home.path())).unwrap();
+        assert!(status.enabled);
+        assert_eq!(status.pending_enabled, Some(true));
+        finish_language_apply(home.path(), &mut prefs, &EditMode::Enable).unwrap();
+        assert_eq!(
+            get_status(config_dir(home.path())).unwrap().pending_enabled,
+            None
+        );
+
+        save_preferences(config_dir(home.path()), Locale::Auto, false).unwrap();
+        let mut prefs = edit_pending(home.path(), &EditMode::Disable);
+        let status = get_status(config_dir(home.path())).unwrap();
+        assert_eq!(status.locale, "fr-FR");
+        assert!(!status.enabled);
+        assert_eq!(status.pending_enabled, Some(false));
+        assert!(
+            prefs.previous_captured,
+            "ownership remains until a successful launch"
+        );
+        finish_language_apply(home.path(), &mut prefs, &EditMode::Disable).unwrap();
+        assert!(prefs.pending.is_none());
+        assert!(!prefs.previous_captured);
+        assert_eq!(
+            get_status(config_dir(home.path())).unwrap().pending_enabled,
+            None
+        );
+    }
+
+    #[test]
+    fn a_new_enable_captures_current_locale_instead_of_an_old_managed_baseline() {
+        let home = tempfile::tempdir().unwrap();
+        fixture_locale(home.path(), "en-US");
+        let prefs = Preferences {
+            previous: Some("fr-FR".into()),
+            previous_captured: true,
+            applied: Some("en-US".into()),
+            ..Preferences::default()
+        };
+        write_preferences(home.path(), None, &prefs).unwrap();
+        save_preferences(config_dir(home.path()), Locale::Chinese, true).unwrap();
+        let prefs = edit_pending(home.path(), &EditMode::Enable);
+        assert_eq!(prefs.previous.as_deref(), Some("en-US"));
+    }
+
+    #[test]
+    fn disabling_preexisting_chinese_clears_it_even_without_recovery_or_with_chinese_previous() {
+        for previous_chinese in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            fixture_locale(home.path(), "zh-CN");
+            if previous_chinese {
+                let prefs = Preferences {
+                    previous_captured: true,
+                    previous: Some("zh-CN".into()),
+                    applied: Some("zh-CN".into()),
+                    ..Preferences::default()
+                };
+                write_preferences(home.path(), None, &prefs).unwrap();
+            }
+            save_preferences(config_dir(home.path()), Locale::Auto, false).unwrap();
+            let mut prefs = edit_pending(home.path(), &EditMode::Disable);
+            let (_, doc) = document(home.path()).unwrap();
+            assert_eq!(locale_value(&doc).unwrap(), None);
+            assert_eq!(doc["desktop"]["unknown"].as_str(), Some("keep"));
+            finish_language_apply(home.path(), &mut prefs, &EditMode::Disable).unwrap();
+            let status = get_status(config_dir(home.path())).unwrap();
+            assert_eq!(status.locale, "auto");
+            assert!(!status.enabled);
+            assert_eq!(status.pending_enabled, None);
+        }
+    }
+
+    #[test]
+    fn failed_launch_after_config_write_keeps_honest_retry_state_for_both_switch_targets() {
+        let home = tempfile::tempdir().unwrap();
+        fixture_locale(home.path(), "fr-FR");
+        save_preferences(config_dir(home.path()), Locale::Chinese, true).unwrap();
+        let result: Result<()> = complete_after_quit(
+            || {
+                edit_pending(home.path(), &EditMode::Enable);
+                Err(CodexxError::Config("fixture launch failure".into()))
+            },
+            || Ok(()),
+        );
+        assert!(result.is_err());
+        let status = get_status(config_dir(home.path())).unwrap();
+        assert!(status.enabled);
+        assert_eq!(status.pending_enabled, Some(true));
+        let mut prefs = edit_pending(home.path(), &EditMode::Enable);
+        assert_eq!(prefs.previous.as_deref(), Some("fr-FR"));
+        finish_language_apply(home.path(), &mut prefs, &EditMode::Enable).unwrap();
+
+        save_preferences(config_dir(home.path()), Locale::Auto, false).unwrap();
+        edit_pending(home.path(), &EditMode::Disable);
+        let status = get_status(config_dir(home.path())).unwrap();
+        assert_eq!(status.locale, "fr-FR");
+        assert_eq!(status.pending_enabled, Some(false));
+        let mut prefs = edit_pending(home.path(), &EditMode::Disable);
+        assert_eq!(
+            locale_value(&document(home.path()).unwrap().1)
+                .unwrap()
+                .as_deref(),
+            Some("fr-FR")
+        );
+        finish_language_apply(home.path(), &mut prefs, &EditMode::Disable).unwrap();
+        assert_eq!(
+            get_status(config_dir(home.path())).unwrap().pending_enabled,
+            None
+        );
+    }
+
+    #[test]
+    fn failed_config_commit_restores_original_pending_and_does_not_claim_external_target() {
+        let home = tempfile::tempdir().unwrap();
+        fixture_locale(home.path(), "fr-FR");
+        save_preferences(config_dir(home.path()), Locale::Chinese, true).unwrap();
+        let (bytes, mut staged) = read_preferences(home.path()).unwrap();
+        staged.pending.as_mut().unwrap().written_locale = Some(LocaleSnapshot {
+            locale: Some("zh-CN".into()),
+        });
+        let result = commit_language_intent(home.path(), bytes.as_deref(), &staged, || {
+            fixture_locale(home.path(), "zh-CN");
+            Err(CodexxError::Config("fixture CAS failure".into()))
+        });
+        assert!(result.is_err());
+        let (after, prefs) = read_preferences(home.path()).unwrap();
+        assert_eq!(after, bytes);
+        assert!(prefs.pending.as_ref().unwrap().written_locale.is_none());
+        let status = get_status(config_dir(home.path())).unwrap();
+        assert!(status.enabled);
+        assert_eq!(status.pending_enabled, None);
+    }
+
+    #[test]
+    fn restart_plan_uses_actual_chinese_even_when_legacy_preferences_are_disabled() {
+        let home = tempfile::tempdir().unwrap();
+        fixture_locale(home.path(), "zh-CN");
+        let mut prefs = Preferences::default();
+        let actual = Some("zh-CN".into());
+        let mode = plan_apply(&prefs, &actual, false).unwrap();
+        assert_eq!(mode, EditMode::Restart(actual));
+        edit_stopped_locale(home.path(), &mut prefs, None, &mode, || Ok(())).unwrap();
+        assert_eq!(
+            locale_value(&document(home.path()).unwrap().1)
+                .unwrap()
+                .as_deref(),
+            Some("zh-CN")
+        );
+        assert!(!prefs_path(home.path()).unwrap().exists());
+        fixture_locale(home.path(), "ja-JP");
+        assert!(edit_stopped_locale(home.path(), &mut prefs, None, &mode, || Ok(())).is_err());
+        assert_eq!(
+            locale_value(&document(home.path()).unwrap().1)
+                .unwrap()
+                .as_deref(),
+            Some("ja-JP")
+        );
+    }
+
     #[test]
     fn toml_language_edit_preserves_comments_unknown_fields_and_other_desktop_settings() {
         let mut doc="# fixture\nmodel='test'\n[desktop]\nunknown_custom='keep' # comment\nlocaleOverride='fr-FR'\n[mcp_servers.fixture]\ncommand='keep'\n".parse::<DocumentMut>().unwrap();
@@ -666,7 +1126,7 @@ mod tests {
             enabled: true,
             ..Preferences::default()
         };
-        edit_stopped_locale(home.path(), &mut prefs, None, false, || Ok(())).unwrap();
+        edit_stopped_locale(home.path(), &mut prefs, None, &EditMode::Enable, || Ok(())).unwrap();
         let (_, doc) = document(home.path()).unwrap();
         assert_eq!(locale_value(&doc).unwrap(), Some("zh-CN".into()));
         assert_eq!(prefs.previous, Some("fr-FR".into()));
@@ -675,7 +1135,14 @@ mod tests {
         changed["desktop"]["unknown"] = value("external edit");
         std::fs::write(&path, changed.to_string()).unwrap();
         let (bytes, _) = read_preferences(home.path()).unwrap();
-        edit_stopped_locale(home.path(), &mut prefs, bytes.as_deref(), true, || Ok(())).unwrap();
+        edit_stopped_locale(
+            home.path(),
+            &mut prefs,
+            bytes.as_deref(),
+            &EditMode::Restore,
+            || Ok(()),
+        )
+        .unwrap();
         let (_, restored) = document(home.path()).unwrap();
         assert_eq!(locale_value(&restored).unwrap(), Some("fr-FR".into()));
         assert_eq!(
@@ -704,7 +1171,14 @@ mod tests {
         };
         write_preferences(home.path(), None, &prefs).unwrap();
         let (bytes, _) = read_preferences(home.path()).unwrap();
-        edit_stopped_locale(home.path(), &mut prefs, bytes.as_deref(), true, || Ok(())).unwrap();
+        edit_stopped_locale(
+            home.path(),
+            &mut prefs,
+            bytes.as_deref(),
+            &EditMode::Restore,
+            || Ok(()),
+        )
+        .unwrap();
         let (_, doc) = document(home.path()).unwrap();
         assert_eq!(locale_value(&doc).unwrap(), Some("ja-JP".into()));
         assert_eq!(doc["desktop"]["unknown"].as_str(), Some("keep"));
@@ -722,7 +1196,7 @@ mod tests {
             ..Preferences::default()
         };
         assert!(
-            edit_stopped_locale(home.path(), &mut prefs, None, false, || Err(
+            edit_stopped_locale(home.path(), &mut prefs, None, &EditMode::Enable, || Err(
                 "fixture app still running".into()
             ))
             .is_err()
@@ -730,7 +1204,10 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
         assert!(!prefs_path(home.path()).unwrap().exists());
         write_preferences(home.path(), None, &prefs).unwrap();
-        assert!(edit_stopped_locale(home.path(), &mut prefs, None, false, || Ok(())).is_err());
+        assert!(
+            edit_stopped_locale(home.path(), &mut prefs, None, &EditMode::Enable, || Ok(()))
+                .is_err()
+        );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
     }
 
@@ -759,7 +1236,10 @@ mod tests {
         let (bytes, mut restored) = read_preferences(home.path()).unwrap();
         assert!(bytes.is_none());
         assert!(!restored.previous_captured);
-        edit_stopped_locale(home.path(), &mut restored, None, true, || Ok(())).unwrap();
+        edit_stopped_locale(home.path(), &mut restored, None, &EditMode::Restore, || {
+            Ok(())
+        })
+        .unwrap();
         let (_, doc) = document(home.path()).unwrap();
         assert_eq!(locale_value(&doc).unwrap(), Some("zh-CN".into()));
     }

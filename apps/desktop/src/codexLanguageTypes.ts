@@ -1,7 +1,8 @@
 export type CodexLocale = "auto" | "zh-CN" | "en-US";
 export type CodexLanguageStatus = {
-  locale: CodexLocale;
+  locale: string;
   enabled: boolean;
+  pendingEnabled: boolean | null;
   supported: boolean;
   appName: string | null;
   appVersion: string | null;
@@ -9,5 +10,4 @@ export type CodexLanguageStatus = {
   message: string;
   readyPages: number;
   restoreAvailable: boolean;
-  requiresManager: boolean;
 };

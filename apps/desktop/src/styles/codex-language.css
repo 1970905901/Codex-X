@@ -1,38 +1,42 @@
-.cx-codex-language {
+/* Reuse the settings page row, icon, typography and theme tokens. */
+.cx-page-setting-row.cx-codex-language {
+  grid-template-columns: 40px minmax(0, 1fr) auto;
+}
+.cx-codex-language .cx-page-setting-copy p {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cx-page-setting-action.cx-codex-language-action {
+  grid-column: auto;
+  justify-self: end;
+  display: grid;
+  justify-items: end;
+  gap: 5px;
+}
+.cx-codex-language-switch {
   display: flex;
-  flex-direction: column;
-  gap: 12px;
-  padding: 20px;
-  border: 1px solid var(--cx-page-border);
-  border-radius: 8px;
-  background: var(--cx-page-surface);
-  color: var(--cx-page-text);
+  align-items: center;
+  gap: 10px;
+  color: var(--cx-page-muted);
+  font-size: 12px;
+  white-space: nowrap;
 }
-.cx-codex-language-heading { display: flex; gap: 12px; align-items: flex-start; }
-.cx-codex-language-heading > svg { flex: 0 0 auto; margin-top: 2px; color: var(--cx-page-blue); }
-.cx-codex-language-heading > div { min-width: 0; }
-.cx-codex-language h3 { margin: 0 0 6px; font-size: 14px; font-weight: 650; }
-.cx-codex-language p { margin: 0; font-size: 12px; line-height: 1.65; overflow-wrap: anywhere; }
-.cx-codex-language-heading p,
-.cx-codex-language-detail { color: var(--cx-page-muted); }
-.cx-codex-language-options,
-.cx-codex-language-actions { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
-.cx-codex-language-options > label:first-child { display: flex; gap: 12px; align-items: center; font-size: 12px; }
-.cx-codex-language select {
-  max-width: 100%;
-  padding: 7px 12px;
-  border: 1px solid var(--cx-page-border);
-  border-radius: 6px;
-  background: var(--cx-page-control);
-  color: var(--cx-page-text);
+.cx-codex-language-switch .ui-toggle {
+  --ui-accent: var(--cx-page-blue);
 }
-.cx-codex-language select:focus-visible { outline: 2px solid var(--cx-page-blue); outline-offset: 2px; }
-.cx-codex-language-status--active,
-.cx-codex-language-notice { color: var(--cx-page-green); }
-.cx-codex-language-error,
-.cx-codex-language-status--failed { color: var(--ui-danger); }
-.cx-codex-language p > svg { display: inline-block; vertical-align: middle; }
-@media (max-width: 520px) {
-  .cx-codex-language { padding: 16px; }
-  .cx-codex-language-actions { gap: 8px; }
+.cx-codex-language-enabled { color: var(--cx-page-blue); }
+.cx-codex-language-restart {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--cx-page-muted);
+  font: inherit;
+  font-size: 11px;
+  line-height: 1.5;
+  cursor: pointer;
 }
+.cx-codex-language-restart:hover:not(:disabled) { color: var(--cx-page-text); }
+.cx-codex-language-restart:focus-visible { outline: 2px solid var(--cx-page-blue); outline-offset: 3px; }
+.cx-codex-language-restart:disabled { cursor: not-allowed; opacity: 0.55; }
+.cx-codex-language .cx-page-setting-copy .cx-codex-language-error { color: var(--ui-danger); }
